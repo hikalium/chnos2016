@@ -1,11 +1,13 @@
 
 
 # http://stackoverflow.com/questions/31479054/is-there-something-like-org-for-nasm-in-gas
-mbr.bin : mbr.o Makefile
-	gobjcopy --only-section=.text --output-target binary mbr.o mbr.bin
 
-mbr.o : mbr.s Makefile
-	gcc -c -m16 -Wall -march=i386 -o mbr.o mbr.s
+%.o : %.S Makefile
+	gcc -c -m16 -Wall -march=i386 -o $*.o $*.S
+
+%.bin : %.o Makefile
+	gobjcopy --only-section=.text --output-target binary $*.o $*.bin
+
 
 testhdd.img : mbr.bin Makefile
 	qemu-img create testhdd.img 128M
@@ -15,7 +17,8 @@ testhdd.img : mbr.bin Makefile
 	dd of=$${mountpoint} if=./mbr.bin bs=1 count=3; \
 	hdiutil detach $${mountpoint}
 
-run : testhdd.img
+run : testhdd.img boot16.bin Makefile
+	cp boot16.bin ./bootfiles/boot16.bin
 	make mount
 	cp -r ./bootfiles/* ./dev/
 	make unmount
@@ -29,6 +32,7 @@ disasm : mbr.bin
 
 clean :
 	-rm *.o
+	-rm *.bin
 
 mount : testhdd.img
 	hdiutil attach testhdd.img -mountpoint ./dev/
@@ -36,6 +40,3 @@ mount : testhdd.img
 unmount :
 	hdiutil detach ./dev/
 
-src_only :
-	make clean
-	-rm mbr.bin

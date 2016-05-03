@@ -1,9 +1,22 @@
 # MBR for CHNOS
+
+#define IPL_SEG		0x7c0
+#define STACK_SEG	0
+#define STACK_OFS	0x7c00
+
+#define DIR_ENT_SIZE				32
+#define OFS_DIR_ENT_Name_11			0
+#define OFS_DIR_ENT_FstClusHI_2		20
+#define OFS_DIR_ENT_FstClusLO_2		26
+#define OFS_DIR_ENT_FileSize_2		28
+
+#define ERR_FAILED				0xe0
+#define ERR_LBA_NOT_AVAILABLE	0xe1
+#define ERR_LBA_READ_FAILED		0xe2
+
 .intel_syntax noprefix
 
-.set CYLS, 0x0ff0
 # http://d.hatena.ne.jp/wocota/20081029/1225274240
-.set IPL_SEG, 0x7c0
 
 .code16
 .text
@@ -43,22 +56,20 @@ BPB_FATSz32:		.int	0x00003ba3	# Number of sectors in FAT
 .org 0x5a
 entry:
 	# 割り込み禁止
-	cli
+	# cli
 	# データセグメント設定
-	mov ax, 0x7c0
+	mov ax, IPL_SEG
 	mov ds, ax
 	mov es, ax
 	# スタックセグメント設定
-	mov ax, 0
+	mov ax, STACK_SEG
 	mov ss, ax
-	mov sp, 0x7c00
+	mov sp, STACK_OFS
 	# 割り込み再開
 	sti
-
+init:
 	# 起動ディスク番号を保存
 	mov [BootDriveID], dl
-	# 改行しておく
-	call text_newline
 
 checkLBA: # DL: ディスク番号
 	cmp dl, 0x80
@@ -72,7 +83,6 @@ checkLBA: # DL: ディスク番号
 	test	cl, 0x01	# extended disk access functions (AH=42h-44h,47h,48h) supported
 	jz	LBANotAvailable 
 	# ここまで来ればLBAアクセスが利用可能
-	# call text_puthex_str_16
 
 readsys:
 	# RootDirの開始位置を計算
@@ -82,11 +92,8 @@ readsys:
 	imul eax, ecx
 	mov cx, [BPB_RsvdSecCnt]
 	add eax, ecx
-	# eaxにRootDir開始セクタが入っているはず
-	ror eax, 16
-	call text_puthex_str_16
-	ror eax, 16
-	call text_puthex_str_16
+	# eaxにRootDir開始セクタが入っている
+	mov [RootDirSector], eax
 
 # LBAアクセスで読んでみる
 	mov [DAP0_StartLBALow], eax
@@ -98,34 +105,75 @@ readsys:
 	lea	si, [DAP0]
 	call	readWithLBA
 
-# 読み込み結果を出力してみる
-	mov si, 0
-	call text_newline
-dumploop:
-	mov al, [si + FATData]
-	call text_puthex_str_8
-	add si, 1
-	cmp si, 256
-	jle dumploop
+# 読み込み結果から検索してみる
+# CX: エントリ　オフセット
+# bx: ファイル名　文字オフセット
+	lea si, [FATData]
+	mov cx, 0
+dir_ent_loop:
+	mov bx, 0
+fname_cmp_loop:
+	mov al, [si + bx]
+	mov dl, [BOOT_FILE_NAME + bx]
+	add bx, 1
+	cmp al, dl
+	jne	fname_cmp_failed
+	cmp bx, 11
+	je	fname_cmp_complete
+	jmp	fname_cmp_loop
+
+fname_cmp_failed:
+	add cx, DIR_ENT_SIZE
+	add si, DIR_ENT_SIZE
+	cmp cx, 512
+	jle dir_ent_loop
+	jmp error
+
+fname_cmp_complete:
+	mov ax, [si + OFS_DIR_ENT_FstClusHI_2]
+	shl eax, 16
+	mov ax, [si + OFS_DIR_ENT_FstClusLO_2]
+	# eaxに開始クラスタ番号が入っている
+	# これをセクタ番号に変換
+	sub	eax, 2
+	mov ecx, 0
+	mov cl, [BPB_SecPerClus]
+	imul eax, ecx
+	mov ecx, [RootDirSector]
+	add eax, ecx
+
+	# 再度読み込む
+	mov [DAP0_StartLBALow], eax
+	mov	ax, ds
+	mov	[DAP0_DestSeg], ax
+	lea	ax, [FATData]
+	mov	[DAP0_DestOfs], ax
+
+	lea si, [DAP0]
+	call    readWithLBA
+
+	mov ax, 0x7f0
+	mov ds, ax
+	ljmp 0x7f0,0
 	
 #
 # Error reporting
 #
-
 error:
-	lea si, [msg_err]
+	mov al, ERR_FAILED
 	jmp finmsg
 
 LBANotAvailable:	# LBAアクセスが無理だったのであきらめる
-	lea si, [msgLBANotAvailable]
+	mov al, ERR_LBA_NOT_AVAILABLE
 	jmp finmsg
 
 LBAError:	# LBAアクセスでエラーが起きた
-	lea si, [msgLBAError]
-	jmp finmsg
+	mov al, ERR_LBA_READ_FAILED
 
 finmsg:
-	call println
+	call text_newline
+	call text_puthex_str_8
+	call text_newline
 fin:
 	hlt
 	jmp fin
@@ -134,28 +182,35 @@ fin:
 # subroutines
 #
 
-println:	# siにある0終端文字列を改行つきで出力
-	pusha
-println_loop:
-	mov	al, [si]
-	add si, 1
-	cmp	al, 0
-	je	fin
-	mov ah, 0x0e
-	mov bx, 15
-	int	0x10
-	jmp	println_loop
-println_end:
-	call text_newline
-	popa
-	ret
+#println:	# siにある0終端文字列を改行つきで出力
+#	pusha
+#println_loop:
+#	mov	al, [si]
+#	add si, 1
+#	cmp	al, 0
+#	je	fin
+#	mov ah, 0x0e
+#	mov bx, 15
+#	int	0x10
+#	jmp	println_loop
+#println_end:
+#	call text_newline
+#	popa
+#	ret
 
-text_puthex_str_16:	# axを出力
-	ror	ax, 8
-	call	text_puthex_str_8
-	rol ax, 8
-	call	text_puthex_str_8
-	ret
+#text_puthex_str_32:	# eaxを出力
+#	ror	eax, 16
+#	call	text_puthex_str_16
+#	rol eax, 16
+#	call	text_puthex_str_16
+#	ret
+
+#text_puthex_str_16:	# axを出力
+#	ror	ax, 8
+#	call	text_puthex_str_8
+#	rol ax, 8
+#	call	text_puthex_str_8
+#	ret
 
 text_puthex_str_8:	# alを出力
 	ror	al, 4
@@ -191,25 +246,7 @@ text_newline:
 
 # http://mbldr.sourceforge.net/specsedd30.pdf
 readWithLBA:	# [DS:SI]: DAP
-	#call text_newline
-	#mov ax, [DAP0_DestOfs]
-	#call text_puthex_str_16
-
-	#call text_newline
-	#mov ax, [DAP0_DestSeg]
-	#call text_puthex_str_16
-
-	#call text_newline
-	#mov ax, si
-	#call text_puthex_str_16
-
 	mov	dl, [BootDriveID]
-
-	#call text_newline
-	#mov ah, 0
-	#mov al, dl
-	#call text_puthex_str_16
-
 	mov ah, 0x42	# Extended Read Sectors From Drive
 	int 0x13
 	jc	LBAError
@@ -219,12 +256,7 @@ readWithLBA:	# [DS:SI]: DAP
 #
 # Data
 #
-
-msg_err:			.string	"CHNIPL_ERROR"
-msgLBANotAvailable:	.string	"ExtINT13H not ready"
-msgLBAError:		.string	"LBA read failed"
-
-.balign 4
+BOOT_FILE_NAME:		.string "BOOT16  BIN"
 DAP0:	# LBAで使用するDisk Address Packet
 				.byte	0x10	# Packet Len
 				.byte	0x00	# Reserved
@@ -238,8 +270,10 @@ DAP0_StartLBAHigh:	.int	0		# start LBA (High)
 	.byte	0x55, 0xaa	# Magic Number
 
 .org 0x0200	# for tmp data
+RootDirSector:
+	.int	0
 BootDriveID:	# MBR起動時にDLにセットされているものをコピーする
 	.byte	0
 
-.balign 8
+.org 0x0300
 FATData:	# dummy

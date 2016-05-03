@@ -2,3 +2,4 @@ dump.bin
 mbr.bin
 *.o
 testhdd.img
+bootfiles
